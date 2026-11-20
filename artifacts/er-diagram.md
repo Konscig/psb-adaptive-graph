@@ -22,12 +22,12 @@
 
 ### Группы
 
-- **Core:** `clients`, `data_snapshots`, `client_snapshot_profiles`.
+- **Core:** `clients`, `data_snapshots`, `client_snapshot_profiles`, `public_organizations`.
 - **Reference:** `dzos`, `products`, `data_sources`.
-- **Business:** `source_observations`, `product_snapshot_states`, `client_product_states`, `evidence_items`, `applicability_rule_sets`, `applicability_criteria`, `recommendation_runs`, `recommendation_run_rule_sets`, `recommendations`, `recommendation_evidence`, `recommendation_feedback`, `product_bundles`.
+- **Business:** `source_observations`, `product_snapshot_states`, `client_product_states`, `evidence_items`, `public_evidence_items`, `applicability_rule_sets`, `applicability_criteria`, `recommendation_runs`, `recommendation_run_rule_sets`, `recommendations`, `recommendation_evidence`, `recommendation_feedback`, `product_bundles`.
 - **Junction:** `product_bundle_items`.
 
-**Границы модели:** одна компания-клиент — самостоятельная запись; корпоративная иерархия и связи владения не моделируются. Флаг холдинга из исходной схемы остаётся атрибутом состояния клиента, а не основанием строить граф владения. В БД предполагаются синтетические демонстрационные записи. Открытый контекст не связывается с синтетическим клиентом без подтверждённого соответствия.
+**Границы модели:** одна компания-клиент — самостоятельная запись; корпоративная иерархия и связи владения не моделируются. Флаг холдинга из исходной схемы остаётся атрибутом состояния клиента, а не основанием строить граф владения. `clients` содержит только синтетические демонстрационные записи. Реальные публичные организации и их сведения хранятся отдельно; FK между ними и синтетическими клиентами нет, банковские состояния для них не создаются.
 
 Не предлагается сохранять экспортированные файлы и временные ошибки импорта: требования к их хранению не заданы, а экспорт может формироваться по запросу. Отдельные таблицы пользователей/ролей не включены: для локального демо ранее подтверждено отсутствие отдельного входа, а способ демонстрации разных прав не выбран. Связь отметок обратной связи с конкретным пользователем также не фиксируется.
 
@@ -78,6 +78,7 @@ erDiagram
 
     data_snapshots {
         uuid id PK
+        uuid parent_snapshot_id FK
         date snapshot_date
         timestamp imported_at
         string source_kind
@@ -120,6 +121,22 @@ erDiagram
         string source_name
         string source_kind
         string canonical_locator
+    }
+
+    public_organizations {
+        uuid id PK
+        string inn UK
+        string name
+        string ogrn
+    }
+
+    public_evidence_items {
+        uuid id PK
+        uuid public_organization_id FK
+        uuid source_observation_id FK
+        text content
+        date as_of_date
+        enum link_status
     }
 
     source_observations {
@@ -167,6 +184,7 @@ erDiagram
         uuid snapshot_id FK
         uuid product_id FK
         string pipeline_version
+        string model_version
         timestamp created_at
         enum run_status
     }
@@ -181,6 +199,7 @@ erDiagram
         uuid run_id FK
         uuid client_snapshot_profile_id FK
         enum review_status
+        enum ml_candidate_status
         text rationale
         text information_gaps
     }
@@ -218,6 +237,9 @@ erDiagram
 
     dzos o|--o{ products : "предоставляет"
     clients ||--o{ client_snapshot_profiles : "имеет срезы"
+    data_snapshots o|--o{ data_snapshots : "исправлен новым срезом"
+    public_organizations ||--o{ public_evidence_items : "публичные факты"
+    source_observations ||--o{ public_evidence_items : "источник факта"
     data_snapshots ||--o{ client_snapshot_profiles : "содержит"
     data_snapshots ||--o{ product_snapshot_states : "актуальность каталога"
     products ||--o{ product_snapshot_states : "статус на срезе"
@@ -292,13 +314,14 @@ erDiagram
 | Поле | Тип | Null | Default | Индекс / ограничение | Описание |
 |---|---|---:|---|---|---|
 | `id` | UUID | NO | — | PK | Идентификатор среза. |
+| `parent_snapshot_id` | UUID | YES | — | FK → `data_snapshots.id` | Срез, из которого создана исправленная версия; `NULL` для первичного импорта. |
 | `snapshot_date` | DATE | NO | — | — | Дата данных из файла. Семантика колонки `дата` требует подтверждения. |
 | `imported_at` | TIMESTAMPTZ | NO | CURRENT_TIMESTAMP* | — | Время загрузки в приложение, отдельно от даты состояния. |
 | `source_kind` | TEXT | NO | — | — | Например, синтетический XLSX/CSV; перечень значений уточнить. |
 | `original_filename` | TEXT | YES | — | — | Имя файла для происхождения; хранение самого файла не подразумевается. |
-| `import_status` | ENUM | NO | — | `loaded`, `rejected`, `partial` — гипотеза | Сводный результат проверки импорта. |
+| `import_status` | ENUM | NO | `loaded` | Только `loaded` для сохранённого среза | Ошибочный preview не создаёт срез. |
 
-\* Предлагаемый default, требует подтверждения. Повторная загрузка той же даты может создавать новый срез; правило идентичности и замены пока не определено.
+\* Предлагаемый default, требует подтверждения. Повторная загрузка той же даты может создавать новый срез; старый не перезаписывается. `parent_snapshot_id` указывает происхождение исправленной копии. Один preview фиксируется атомарно и не создаёт второй срез при повторном commit.
 
 ### `client_snapshot_profiles`
 
@@ -380,6 +403,34 @@ erDiagram
 
 **Бизнес-правила:** один `data_source` может иметь несколько наблюдений/версий. Срок хранения и сохранение самого файла/документа не определены.
 
+### `public_organizations`
+
+**Назначение:** реальные организации, выбранные для режима открытых фактов. Не являются клиентами Банка в этой модели.
+
+| Поле | Тип | Null | Default | Индекс / ограничение | Описание |
+|---|---|---:|---|---|---|
+| `id` | UUID | NO | — | PK | Технический ключ. |
+| `inn` | VARCHAR(10) | NO | — | UK | Проверенный ИНН юридического лица. |
+| `name` | TEXT | NO | — | — | Название из источника. |
+| `ogrn` | VARCHAR | YES | — | — | Дополнительный идентификатор для сверки. |
+
+**Правило:** отсутствует FK на `clients`; неизвестный статус банковских продуктов не материализуется как отрицательный.
+
+### `public_evidence_items`
+
+**Назначение:** точный фрагмент об открытой организации с источником и датой.
+
+| Поле | Тип | Null | Default | Индекс / ограничение | Описание |
+|---|---|---:|---|---|---|
+| `id` | UUID | NO | — | PK | Технический ключ. |
+| `public_organization_id` | UUID | NO | — | FK → `public_organizations.id` | Реальная организация. |
+| `source_observation_id` | UUID | NO | — | FK → `source_observations.id` | Конкретный URL/дата/хеш источника. |
+| `content` | TEXT | NO | — | — | Точный цитируемый фрагмент. |
+| `as_of_date` | DATE | YES | — | — | Дата, к которой относится факт. |
+| `link_status` | ENUM | NO | — | `verified`, `uncertain` | Надёжность привязки по ИНН/ОГРН и названию. |
+
+**Правило:** нет FK на `client_snapshot_profiles` и нет вывода о продукте или клиентском статусе.
+
 ### `evidence_items`
 
 **Назначение:** заметки, сведения о конкурентах, условиях и отдельный открытый контекст с сохранением происхождения.
@@ -440,6 +491,7 @@ erDiagram
 | `snapshot_id` | UUID | NO | — | FK → `data_snapshots.id` | Входной срез данных. |
 | `product_id` | UUID | NO | — | FK → `products.id` | Выбранный НБС. |
 | `pipeline_version` | VARCHAR | YES | — | — | Версия кода/конфигурации pipeline, если команда решит её фиксировать. |
+| `model_version` | VARCHAR | YES | — | — | Версия артефакта экспериментального классификатора; `NULL`, если он не запускался. Манифест обучения хранится отдельно от клиентских данных. |
 | `created_at` | TIMESTAMPTZ | NO | CURRENT_TIMESTAMP* | — | Время запуска. |
 | `run_status` | ENUM | NO | — | `started`, `completed`, `failed` — гипотеза | Технический результат запуска. |
 
@@ -466,6 +518,7 @@ erDiagram
 | `run_id` | UUID | NO | — | FK → `recommendation_runs.id` | Запуск, создавший результат. |
 | `client_snapshot_profile_id` | UUID | NO | — | FK → `client_snapshot_profiles.id` | Клиент в анализируемом срезе. |
 | `review_status` | ENUM | NO | — | `consider`, `insufficient_data`, `caution` — предложение | Статус подсказки, не статус применимости. |
+| `ml_candidate_status` | ENUM | YES | — | `consider`, `insufficient_data`, `caution` — эксперимент | Отдельный вывод классификатора по синтетическому примеру; `NULL` без модели и во всём режиме открытых фактов. Не подменяет `review_status`. |
 | `rationale` | TEXT | YES | — | — | Интерпретация фактов: почему продукт стоит рассмотреть. |
 | `information_gaps` | TEXT | YES | — | — | Что менеджеру необходимо проверить; структура списка уточняется до DDL. |
 | `exclusion_reason` | TEXT | YES | — | — | Причина исключения, если применимо. |
